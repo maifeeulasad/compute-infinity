@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "compute-infinity"
+version = "0.1.0"
+description = "A minimal Python library template using uv, ruff, and pytest."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Maifee Ul Asad<maifeeulasad@gmail.com>" }
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/maifeeulasad/compute-infinity"
+Issues = "https://github.com/maifeeulasad/compute-infinity/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/compute_infinity"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.11.0"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
