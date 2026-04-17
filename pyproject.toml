@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "compute-infinity"
-version = "0.1.0"
+version = "0.0.0"
 description = "A minimal Python library template using uv, ruff, and pytest."
 readme = "README.md"
 requires-python = ">=3.10"
