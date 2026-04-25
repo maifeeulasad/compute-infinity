@@ -4,41 +4,108 @@ build-backend = "hatchling.build"
 
 [project]
 name = "compute-infinity"
-version = "0.0.0"
-description = "A minimal Python library template using uv, ruff, and pytest."
+version = "0.1.0"
+description = "High-performance GPU compute library with unified backend support for NVIDIA, AMD, and Intel GPUs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
-  { name = "Maifee Ul Asad<maifeeulasad@gmail.com>" }
+  { name = "Maifee Ul Asad", email = "maifeeulasad@gmail.com" }
 ]
-dependencies = []
+keywords = [
+    "gpu",
+    "cuda",
+    "opencl",
+    "rocm",
+    "compute",
+    "parallel",
+    "nvidia",
+    "amd",
+    "intel",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 
 [project.optional-dependencies]
+# CUDA support for NVIDIA GPUs
 cuda = [
-  "numba>=0.60.0",
+    "numba[cuda]>=0.60.0",
+]
+# OpenCL support for AMD, Intel, and NVIDIA GPUs via PyOpenCL
+opencl = [
+    "pyopencl>=2024.1",
+    "numpy>=1.24.0",
+]
+# ROCm support for AMD GPUs
+rocm = [
+    "numba[rocm]>=0.60.0",
+]
+# All GPU backends
+all-gpu = [
+    "numba[cuda,rocm]>=0.60.0",
+    "pyopencl>=2024.1",
+    "numpy>=1.24.0",
+]
+# Development dependencies
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-benchmark>=4.0.0",
+    "ruff>=0.1.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/maifeeulasad/compute-infinity"
+Documentation = "https://github.com/maifeeulasad/compute-infinity#readme"
+Repository = "https://github.com/maifeeulasad/compute-infinity"
 Issues = "https://github.com/maifeeulasad/compute-infinity/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/compute_infinity"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+]
+
 [dependency-groups]
 dev = [
-  "pytest>=8.0.0",
-  "ruff>=0.11.0"
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-benchmark>=4.0.0",
+    "ruff>=0.1.0",
+    "numpy>=1.24.0",
 ]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+indent-width = 4
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP"]
+select = ["E", "F", "I", "B", "UP", "N", "W", "C4"]
+ignore = ["E501"]  # Line too long (handled by formatter)
+
+[tool.ruff.lint.isort]
+known-first-party = ["compute_infinity"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --tb=short"
 testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.pytest-benchmark]
+save = true
+file_path = "benchmark_results.json"
