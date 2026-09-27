@@ -106,13 +106,23 @@ def is_number(value: object) -> bool:
 def is_vector(value: object) -> bool:
     if is_number(value) or isinstance(value, (str, bytes)):
         return False
+    # Array-like (e.g. NumPy ndarray): classify by number of dimensions.
+    shape = getattr(value, "shape", None)
+    if shape is not None and hasattr(value, "ndim"):
+        return len(shape) == 1
     if not isinstance(value, Sequence):
         return False
     return all(is_number(item) for item in value)
 
 
 def is_matrix(value: object) -> bool:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+    if isinstance(value, (str, bytes)):
+        return False
+    # Array-like (e.g. NumPy ndarray): a matrix is 2-D.
+    shape = getattr(value, "shape", None)
+    if shape is not None and hasattr(value, "ndim"):
+        return len(shape) == 2
+    if not isinstance(value, Sequence):
         return False
     if len(value) == 0:
         return False
