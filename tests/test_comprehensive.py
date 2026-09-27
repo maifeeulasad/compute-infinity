@@ -303,6 +303,96 @@ class TestCUDABackend:
         assert all(x == 7.0 for x in result)
 
 
+class TestOutOfMemoryAvoidance:
+    """The headline guarantee: work that OOMs with naive one-shot GPU code
+    completes successfully through compute-infinity's auto-chunked backend.
+
+    To provoke a *real* device OOM without allocating VRAM-scale data on the
+    host, we first reserve most of the free VRAM (leaving a controlled
+    headroom), then size the workload so that a single naive allocation of all
+    three operand buffers exceeds that headroom while each auto-sized chunk
+    fits comfortably. The reservation is always released at the end.
+    """
+
+    _HEADROOM_BYTES = 768 * 1024 * 1024   # VRAM left free after reservation
+    _F32 = 4
+
+    @pytest.fixture
+    def cuda_env(self):
+        cuda_backend = CudaArithmeticBackend()
+        if not cuda_backend.is_available:
+            pytest.skip("CUDA not available")
+        np = pytest.importorskip("numpy")
+        from numba import cuda
+        return cuda_backend, np, cuda
+
+    def test_naive_oom_but_compute_infinity_succeeds(self, cuda_env):
+        import gc
+
+        backend, np, cuda = cuda_env
+        ctx = cuda.current_context()
+        free_bytes, _total = ctx.get_memory_info()
+
+        # Need enough headroom to reserve against and still stage a workload.
+        if free_bytes < self._HEADROOM_BYTES + 512 * 1024 * 1024:
+            pytest.skip("not enough free VRAM to stage an OOM demonstration")
+
+        # 1. Reserve most of the free VRAM, leaving only _HEADROOM_BYTES.
+        reserve_elems = (free_bytes - self._HEADROOM_BYTES) // self._F32
+        hog = None
+        try:
+            try:
+                hog = cuda.device_array(reserve_elems, dtype=np.float32)
+            except Exception:
+                pytest.skip("could not reserve VRAM (device busy)")
+
+            free_after, _ = ctx.get_memory_info()
+
+            # Size one operand so that all three buffers together (~1.35x the
+            # remaining VRAM) cannot coexist, but two can -- guaranteeing the
+            # naive one-shot path runs out of memory partway through.
+            per_buffer_bytes = int(free_after * 0.45)
+            n = per_buffer_bytes // self._F32
+            if n < 1_000_000:
+                pytest.skip("insufficient headroom for a meaningful workload")
+
+            a = np.arange(n, dtype=np.float32)
+            b = np.arange(n, dtype=np.float32)
+
+            # 2. Naive path: no chunking, everything on the device at once.
+            #    This is what a user writes WITHOUT compute-infinity.
+            oomed = False
+            d_left = d_right = d_out = None
+            try:
+                d_left = cuda.to_device(a)
+                d_right = cuda.to_device(b)
+                d_out = cuda.device_array(n, dtype=np.float32)  # third buffer OOMs
+            except Exception:
+                oomed = True
+            finally:
+                del d_left, d_right, d_out
+                gc.collect()
+
+            if not oomed:
+                pytest.skip("device did not OOM under the staged conditions")
+
+            # 3. compute-infinity on the SAME data: auto chunking keeps each
+            #    device allocation within free VRAM, so it completes. Voila.
+            result = backend.plus(a, b)
+
+            assert len(result) == n
+            # Spot-check correctness (a + b == 2*i). Values are float32, whose
+            # integer precision runs out past 2**24, so use exact checks only
+            # in that range and a relative tolerance beyond it.
+            assert result[0] == 0.0
+            assert result[1000] == 2000.0
+            assert result[-1] == pytest.approx(2.0 * (n - 1), rel=1e-4)
+        finally:
+            if hog is not None:
+                del hog
+            gc.collect()
+
+
 # =============================================================================
 # Backend Factory Tests
 # =============================================================================
