@@ -15,9 +15,13 @@ from .core import (
     Number,
     Operand,
     ensure_operand,
+    from_flat_buffer,
     is_matrix,
     is_number,
     is_vector,
+    optimal_launch_config,
+    shape_of,
+    to_flat_buffer,
 )
 
 # Lazy imports for ROCm/HIP via Numba
@@ -26,6 +30,12 @@ try:
 except Exception:
     roc = None
     jit = None
+
+# NumPy is required by Numba for host<->device transfers.
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
 
 # =============================================================================
 # Operation Codes
@@ -209,45 +219,20 @@ class ROCmArithmeticBackend(ComputeBackendBase):
                 "AMD ROCm and have an AMD GPU."
             )
 
-    def _to_flat_list(self, operand: Operand) -> tuple[list[float], int]:
-        """Convert operand to flat list and return size."""
-        if is_number(operand):
-            return [float(operand)], 1
-        if is_vector(operand):
-            return [float(x) for x in operand], len(operand)
-        if is_matrix(operand):
-            flat = [float(x) for row in operand for x in row]
-            return flat, len(flat)
-        raise TypeError("Unsupported operand type")
-
-    def _from_flat_list(self, flat: list[float], original_shape: tuple[int, ...]) -> Operand:
-        """Convert flat list back to original shape."""
-        if len(original_shape) == 0:
-            return flat[0] if len(flat) == 1 else flat
-        if len(original_shape) == 1:
-            return flat
-        if len(original_shape) == 2:
-            rows, cols = original_shape
-            return [flat[i * cols:(i + 1) * cols] for i in range(rows)]
-        return flat
+    def _to_flat(self, operand: Operand):
+        """Flatten an operand into a contiguous float32 device-ready array."""
+        return to_flat_buffer(operand, np, np.float32)
 
     def _get_operand_shape(self, operand: Operand) -> tuple[int, ...]:
         """Get the shape of an operand."""
-        if is_number(operand):
-            return ()
-        if is_vector(operand):
-            return (len(operand),)
-        if is_matrix(operand):
-            return (len(operand), len(operand[0]))
-        return ()
+        return shape_of(operand)
 
-    def _get_threads_per_block(self, size: int) -> int:
-        """Calculate optimal threads per block."""
-        return min(256, size)
+    def _launch_config(self, size: int) -> tuple[int, int]:
+        """Auto-scale (blocks, threads) to the problem size.
 
-    def _get_blocks_per_grid(self, size: int, threads: int) -> int:
-        """Calculate blocks per grid."""
-        return (size + threads - 1) // threads
+        AMD GPUs use a wavefront of 64, so threads-per-block is rounded to that.
+        """
+        return optimal_launch_config(size, max_threads_per_block=256, warp_size=64)
 
     def plus(self, left: Operand, right: Operand) -> Operand:
         self._ensure_rocm()
@@ -274,70 +259,68 @@ class ROCmArithmeticBackend(ComputeBackendBase):
         if is_number(left) and is_number(right):
             return self._apply_scalar_op(float(left), float(right), op_code)
 
-        # Get flat representations
-        left_flat, left_size = self._to_flat_list(left)
-        right_flat, right_size = self._to_flat_list(right)
+        # Get flat array representations (zero-copy when already ndarrays)
+        left_flat, shape = self._to_flat(left)
+        right_flat, _ = self._to_flat(right)
+        left_size = left_flat.size
+        right_size = right_flat.size
 
         if left_size != right_size:
             raise ValueError(f"Shape mismatch: {left_size} vs {right_size}")
 
         # Special handling for scalar broadcast
         if left_size == 1:
-            result = [self._apply_scalar_op(left_flat[0], right_flat[0], op_code)]
-            return self._from_flat_list(result, ())
+            result = [self._apply_scalar_op(float(left_flat[0]), float(right_flat[0]), op_code)]
+            return from_flat_buffer(np.asarray(result, dtype=np.float32), ())
 
         # Create device arrays
         d_left = roc.to_device(left_flat)
         d_right = roc.to_device(right_flat)
-        d_out = roc.device_array(left_size, dtype=float)
+        d_out = roc.device_array(left_size, dtype=np.float32)
 
-        # Launch kernel
-        threads = self._get_threads_per_block(left_size)
-        blocks = self._get_blocks_per_grid(left_size, threads)
+        # Launch kernel with auto-scaled parameters
+        blocks, threads = self._launch_config(left_size)
 
         _roc_binary_kernel[blocks, threads](d_left, d_right, d_out, op_code, left_size)
         roc.jitmodule.device.synchronize()
 
         # Copy back to host
         result = d_out.copy_to_host()
-        shape = self._get_operand_shape(left)
-        return self._from_flat_list(result.tolist(), shape)
+        return from_flat_buffer(result, shape)
 
     def _broadcast_scalar_left(self, scalar: float, right: Operand, op_code: int) -> Operand:
         """Broadcast scalar from left."""
-        right_flat, size = self._to_flat_list(right)
+        right_flat, shape = self._to_flat(right)
+        size = right_flat.size
 
-        d_scalar = roc.to_device([scalar])
+        d_scalar = roc.to_device(np.array([scalar], dtype=np.float32))
         d_right = roc.to_device(right_flat)
-        d_out = roc.device_array(size, dtype=float)
+        d_out = roc.device_array(size, dtype=np.float32)
 
-        threads = self._get_threads_per_block(size)
-        blocks = self._get_blocks_per_grid(size, threads)
+        blocks, threads = self._launch_config(size)
 
         _roc_scalar_left_kernel[blocks, threads](d_scalar, d_right, d_out, op_code, size)
         roc.jitmodule.device.synchronize()
 
         result = d_out.copy_to_host()
-        shape = self._get_operand_shape(right)
-        return self._from_flat_list(result.tolist(), shape)
+        return from_flat_buffer(result, shape)
 
     def _broadcast_scalar_right(self, left: Operand, scalar: float, op_code: int) -> Operand:
         """Broadcast scalar from right."""
-        left_flat, size = self._to_flat_list(left)
+        left_flat, shape = self._to_flat(left)
+        size = left_flat.size
 
         d_left = roc.to_device(left_flat)
-        d_scalar = roc.to_device([scalar])
-        d_out = roc.device_array(size, dtype=float)
+        d_scalar = roc.to_device(np.array([scalar], dtype=np.float32))
+        d_out = roc.device_array(size, dtype=np.float32)
 
-        threads = self._get_threads_per_block(size)
-        blocks = self._get_blocks_per_grid(size, threads)
+        blocks, threads = self._launch_config(size)
 
         _roc_scalar_right_kernel[blocks, threads](d_left, d_scalar, d_out, op_code, size)
         roc.jitmodule.device.synchronize()
 
         result = d_out.copy_to_host()
-        shape = self._get_operand_shape(left)
-        return self._from_flat_list(result.tolist(), shape)
+        return from_flat_buffer(result, shape)
 
     def _apply_scalar_op(self, left: float, right: float, op_code: int) -> float:
         """Apply scalar operation on CPU."""
@@ -353,7 +336,6 @@ class ROCmArithmeticBackend(ComputeBackendBase):
         """Matrix multiplication / dot product."""
         self._ensure_rocm()
 
-        import numpy as np
         left_np = np.asarray(left)
         right_np = np.asarray(right)
 
@@ -371,7 +353,6 @@ class ROCmArithmeticBackend(ComputeBackendBase):
             return list(matrix)
 
         if is_matrix(matrix):
-            import numpy as np
             return np.transpose(matrix).tolist()
 
         raise TypeError("Unsupported operand type")
@@ -388,20 +369,19 @@ class ROCmArithmeticBackend(ComputeBackendBase):
 
     def _unary_op(self, operand: Operand, op_code: int) -> Operand:
         """Execute unary operation on GPU."""
-        flat, size = self._to_flat_list(operand)
+        flat, shape = self._to_flat(operand)
+        size = flat.size
 
         d_input = roc.to_device(flat)
-        d_output = roc.device_array(size, dtype=float)
+        d_output = roc.device_array(size, dtype=np.float32)
 
-        threads = self._get_threads_per_block(size)
-        blocks = self._get_blocks_per_grid(size, threads)
+        blocks, threads = self._launch_config(size)
 
         _roc_unary_kernel[blocks, threads](d_input, d_output, op_code, size)
         roc.jitmodule.device.synchronize()
 
         result = d_output.copy_to_host()
-        shape = self._get_operand_shape(operand)
-        return self._from_flat_list(result.tolist(), shape)
+        return from_flat_buffer(result, shape)
 
     def fill(self, shape: tuple[int, ...], value: Number) -> Operand:
         """Create array filled with value."""
@@ -411,10 +391,9 @@ class ROCmArithmeticBackend(ComputeBackendBase):
         for dim in shape:
             size *= dim
 
-        d_out = roc.device_array(size, dtype=float)
+        d_out = roc.device_array(size, dtype=np.float32)
 
-        threads = self._get_threads_per_block(size)
-        blocks = self._get_blocks_per_grid(size, threads)
+        blocks, threads = self._launch_config(size)
 
         _roc_fill_kernel[blocks, threads](d_out, float(value), size)
         roc.jitmodule.device.synchronize()
@@ -424,8 +403,7 @@ class ROCmArithmeticBackend(ComputeBackendBase):
         if len(shape) == 1:
             return result.tolist()
         elif len(shape) == 2:
-            rows, cols = shape
-            return [[result[i * cols + j] for j in range(cols)] for i in range(rows)]
+            return result.reshape(shape).tolist()
         return float(result[0])
 
     def zeros(self, shape: tuple[int, ...]) -> Operand:
