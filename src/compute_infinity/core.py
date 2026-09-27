@@ -160,6 +160,105 @@ def shape_of(operand: Operand) -> tuple[int, ...]:
 
 
 # =============================================================================
+# Host <-> Device Conversion
+# =============================================================================
+#
+# The hot path of every GPU backend is moving data between Python objects and
+# device buffers. Building intermediate Python lists (``[float(x) for x in ...]``
+# then ``list.tolist()`` again on the way back) costs O(n) in the interpreter
+# and dominates wall-clock time for large operands, leaving the GPU idle while
+# VRAM sits nearly empty. The helpers below do the conversion once, in
+# vectorized C (via NumPy), and pass arrays straight through with no copy when
+# the caller already handed us an array.
+
+def to_flat_buffer(operand: Operand, np: Any, dtype: Any = None) -> tuple[Any, tuple[int, ...]]:
+    """Flatten an operand into a contiguous 1-D device-ready array.
+
+    Returns ``(flat_array, shape)``. When ``operand`` is already a contiguous
+    array of the requested dtype the conversion is zero-copy. No per-element
+    Python loop is ever executed.
+    """
+    if dtype is None:
+        dtype = np.float32
+    if is_number(operand):
+        return np.asarray([operand], dtype=dtype), ()
+    # ``np.asarray`` reuses the buffer when dtype/layout already match, so an
+    # ndarray input never triggers a copy here. The shape is read back from the
+    # array so NumPy inputs (which are not Python ``Sequence``s) are handled.
+    arr = np.asarray(operand, dtype=dtype)
+    shape = tuple(arr.shape)
+    return np.ascontiguousarray(arr).reshape(-1), shape
+
+
+def from_flat_buffer(flat: Any, shape: tuple[int, ...]) -> Operand:
+    """Reshape a flat result array back to ``shape`` as native Python types.
+
+    Uses NumPy's C-level ``reshape``/``tolist`` instead of manual index
+    arithmetic in Python.
+    """
+    if shape == ():
+        return float(flat[0])
+    if len(shape) == 1:
+        return flat.tolist()
+    return flat.reshape(shape).tolist()
+
+
+# =============================================================================
+# Auto-Scaling Launch / Chunk Parameters
+# =============================================================================
+#
+# Hardcoded launch parameters (a fixed ``256`` threads-per-block, a fixed
+# ``1024*1024`` element chunk) ignore both the device and the problem size.
+# The fixed chunk in particular forces large operands through many small
+# host<->device round trips even when there is plenty of free VRAM to process
+# them in one shot -- the classic "lots of free memory, still slow" symptom.
+# These helpers scale the parameters to the actual hardware.
+
+def optimal_launch_config(
+    size: int,
+    max_threads_per_block: int = 256,
+    warp_size: int = 32,
+) -> tuple[int, int]:
+    """Return ``(blocks_per_grid, threads_per_block)`` scaled to ``size``.
+
+    Threads-per-block is rounded up to a whole number of warps (up to the
+    device limit) so small operands do not waste a whole 256-thread block and
+    large ones saturate the device.
+    """
+    if size <= 0:
+        return 1, 1
+    warp_size = max(1, warp_size)
+    threads = ((size + warp_size - 1) // warp_size) * warp_size
+    threads = max(warp_size, min(threads, max_threads_per_block))
+    blocks = (size + threads - 1) // threads
+    return blocks, threads
+
+
+def optimal_chunk_size(
+    free_bytes: int | None,
+    *,
+    num_buffers: int = 3,
+    bytes_per_element: int = 4,
+    safety: float = 0.8,
+    minimum: int = 1 << 16,
+    fallback: int = 1 << 24,
+) -> int:
+    """Derive an element chunk size from actual free device memory.
+
+    ``num_buffers`` accounts for the operands plus output living on the device
+    simultaneously. Falls back to a sane constant when memory info is
+    unavailable. The result is intentionally large: chunking exists only to
+    avoid OOM, so we use as much of the free VRAM as ``safety`` allows and keep
+    round trips to a minimum.
+    """
+    if not free_bytes or free_bytes <= 0:
+        return fallback
+    usable = int(free_bytes * safety)
+    per_element = max(1, num_buffers * bytes_per_element)
+    return max(minimum, usable // per_element)
+
+
+# =============================================================================
 # Result Type
 # =============================================================================
 

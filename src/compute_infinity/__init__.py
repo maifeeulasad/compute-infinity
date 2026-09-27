@@ -43,14 +43,18 @@ from .core import (
     Vector,
     chunked_operation,
     ensure_operand,
+    from_flat_buffer,
     get_element_count,
     hello_world,
     is_matrix,
     # Utilities
     is_number,
     is_vector,
+    optimal_chunk_size,
+    optimal_launch_config,
     same_shape,
     shape_of,
+    to_flat_buffer,
     validate_shape_compatible,
 )
 
@@ -105,6 +109,10 @@ __all__ = [
     "shape_of",
     "chunked_operation",
     "validate_shape_compatible",
+    "to_flat_buffer",
+    "from_flat_buffer",
+    "optimal_launch_config",
+    "optimal_chunk_size",
     # Base class
     "ComputeBackendBase",
     # Factory
