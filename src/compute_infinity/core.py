@@ -416,8 +416,13 @@ class BackendFactory:
             }
             backend = backend_map.get(backend.lower(), ComputeBackend.CPU_FALLBACK)
 
+        # An explicit CPU request must return the CPU backend, not silently
+        # fall through to an available GPU.
+        if backend == ComputeBackend.CPU_FALLBACK:
+            return CPUFallbackBackend(memory_config=memory_config)
+
         # Try to create requested backend
-        if backend and backend != ComputeBackend.CPU_FALLBACK:
+        if backend:
             for backend_class in cls._backends:
                 instance = backend_class(**kwargs)
                 if instance.backend_type == backend and instance.is_available:
