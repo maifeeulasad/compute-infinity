@@ -206,3 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 uv.lock.1
+
+# pytest-benchmark results
+.benchmarks/
+benchmark_results.json
