@@ -418,6 +418,38 @@ class TestPerformance:
         assert elapsed < 5.0  # Less than 5 seconds
 
 
+class TestPytestBenchmark:
+    """Micro-benchmarks driven by the pytest-benchmark ``benchmark`` fixture.
+
+    These are the tests picked up by ``pytest --benchmark-only``. Each one
+    exercises the default backend on the current machine (GPU when available,
+    CPU fallback otherwise).
+    """
+
+    @pytest.fixture
+    def bench_backend(self, default_backend):
+        if not default_backend.is_available:
+            pytest.skip("No backend available")
+        return default_backend
+
+    @pytest.mark.parametrize("size", [10_000, 1_000_000])
+    def test_vector_plus(self, benchmark, bench_backend, size):
+        a = generate_random_vector(size)
+        b = generate_random_vector(size)
+        result = benchmark(bench_backend.plus, a, b)
+        assert len(result) == size
+
+    def test_matrix_plus(self, benchmark, bench_backend):
+        a = generate_random_matrix(256, 256)
+        b = generate_random_matrix(256, 256)
+        result = benchmark(bench_backend.plus, a, b)
+        assert len(result) == 256
+
+    def test_vector_sqrt(self, benchmark, bench_backend):
+        a = [float(abs(x)) for x in generate_random_vector(1_000_000)]
+        benchmark(bench_backend.sqrt, a)
+
+
 # =============================================================================
 # Chunked Operation Tests
 # =============================================================================
