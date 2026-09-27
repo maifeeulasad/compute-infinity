@@ -17,9 +17,12 @@ from .core import (
     Number,
     Operand,
     ensure_operand,
+    from_flat_buffer,
     is_matrix,
     is_number,
     is_vector,
+    shape_of,
+    to_flat_buffer,
 )
 
 # Lazy import for OpenCL
@@ -29,6 +32,12 @@ try:
 except Exception:  # pragma: no cover
     cl = None
     CLArray = None
+
+# NumPy is required by PyOpenCL for host buffers and transfers.
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
 
 # =============================================================================
 # OpenCL Kernel Source
@@ -390,27 +399,9 @@ class OpenCLArithmeticBackend(ComputeBackendBase):
                 "the appropriate OpenCL runtime for your GPU."
             )
 
-    def _to_flat_list(self, operand: Operand) -> tuple[list[float], int]:
-        """Convert operand to flat list and return size."""
-        if is_number(operand):
-            return [float(operand)], 1
-        if is_vector(operand):
-            return [float(x) for x in operand], len(operand)
-        if is_matrix(operand):
-            flat = [float(x) for row in operand for x in row]
-            return flat, len(flat)
-        raise TypeError("Unsupported operand type")
-
-    def _from_flat_list(self, flat: list[float], original_shape: tuple[int, ...]) -> Operand:
-        """Convert flat list back to original shape."""
-        if len(original_shape) == 0:
-            return flat[0] if len(flat) == 1 else flat
-        if len(original_shape) == 1:
-            return flat
-        if len(original_shape) == 2:
-            rows, cols = original_shape
-            return [flat[i * cols:(i + 1) * cols] for i in range(rows)]
-        return flat
+    def _to_flat(self, operand: Operand):
+        """Flatten an operand into a contiguous float32 host array."""
+        return to_flat_buffer(operand, np, np.float32)
 
     def _create_buffer(self, size: int) -> Any:
         """Create an OpenCL buffer."""
@@ -447,92 +438,83 @@ class OpenCLArithmeticBackend(ComputeBackendBase):
         if is_number(left) and is_number(right):
             return self._apply_scalar_op(float(left), float(right), op_code)
 
-        # Get flat representations
-        left_flat, left_size = self._to_flat_list(left)
-        right_flat, right_size = self._to_flat_list(right)
+        # Get flat array representations (zero-copy when already ndarrays)
+        left_flat, shape = self._to_flat(left)
+        right_flat, _ = self._to_flat(right)
+        left_size = left_flat.size
+        right_size = right_flat.size
 
         if left_size != right_size:
             raise ValueError(f"Shape mismatch: {left_size} vs {right_size}")
 
         # Special handling for scalar broadcast
         if left_size == 1:
-            result = [self._apply_scalar_op(left_flat[0], right_flat[0], op_code)]
-            return self._from_flat_list(result, ())
+            result = self._apply_scalar_op(float(left_flat[0]), float(right_flat[0]), op_code)
+            return from_flat_buffer(np.asarray([result], dtype=np.float32), ())
 
-        # Create buffers
-        buf_left = cl.Buffer(self._ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                             hostbuf=left_flat)
-        buf_right = cl.Buffer(self._ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                              hostbuf=right_flat)
-        buf_out = cl.Buffer(self._ctx, cl.mem_flags.WRITE_ONLY, left_size * 4)
+        mf = cl.mem_flags
+        buf_left = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=left_flat)
+        buf_right = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=right_flat)
+        buf_out = cl.Buffer(self._ctx, mf.WRITE_ONLY, left_flat.nbytes)
 
-        # Enqueue kernel
+        # local size None lets the OpenCL runtime auto-select the work-group size.
         self._kernels["binary_op"](
             self._queue, (left_size,), None,
             buf_left, buf_right, buf_out,
-            op_code, left_size
+            np.int32(op_code), np.int32(left_size)
         )
+
+        result_np = np.empty(left_size, dtype=np.float32)
+        cl.enqueue_copy(self._queue, result_np, buf_out)
         self._queue.finish()
 
-        # Read result
-        result = cl.Buffer.empty(self._ctx, cl.mem_flags.READ_ONLY, left_size * 4)
-        cl.enqueue_copy(self._queue, result, buf_out)
-        self._queue.finish()
-
-        result_flat = cl.array.arange(self._queue, left_size, 0, 1, dtype=self._program.context.bindings[0].dtype)
-        result_np = result_flat.get()
-
-        # Determine output shape
-        left_shape = self._get_operand_shape(left)
-        return self._from_flat_list(result_np.tolist(), left_shape)
+        return from_flat_buffer(result_np, shape)
 
     def _broadcast_scalar_left(self, scalar: float, right: Operand, op_code: int) -> Operand:
         """Broadcast scalar on left to operand."""
-        right_flat, size = self._to_flat_list(right)
+        right_flat, shape = self._to_flat(right)
+        size = right_flat.size
 
-        buf_scalar = cl.Buffer(self._ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                               hostbuf=[scalar])
-        buf_right = cl.Buffer(self._ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                              hostbuf=right_flat)
-        buf_out = cl.Buffer(self._ctx, cl.mem_flags.WRITE_ONLY, size * 4)
+        mf = cl.mem_flags
+        buf_scalar = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                               hostbuf=np.array([scalar], dtype=np.float32))
+        buf_right = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=right_flat)
+        buf_out = cl.Buffer(self._ctx, mf.WRITE_ONLY, right_flat.nbytes)
 
         self._kernels["scalar_left"](
             self._queue, (size,), None,
             buf_scalar, buf_right, buf_out,
-            op_code, size
+            np.int32(op_code), np.int32(size)
         )
+
+        result_np = np.empty(size, dtype=np.float32)
+        cl.enqueue_copy(self._queue, result_np, buf_out)
         self._queue.finish()
 
-        result = [0.0] * size
-        cl.enqueue_copy(self._queue, result, buf_out)
-        self._queue.finish()
-
-        right_shape = self._get_operand_shape(right)
-        return self._from_flat_list(result, right_shape)
+        return from_flat_buffer(result_np, shape)
 
     def _broadcast_scalar_right(self, left: Operand, scalar: float, op_code: int) -> Operand:
         """Broadcast scalar on right to operand."""
-        left_flat, size = self._to_flat_list(left)
+        left_flat, shape = self._to_flat(left)
+        size = left_flat.size
 
-        buf_left = cl.Buffer(self._ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                             hostbuf=left_flat)
-        buf_scalar = cl.Buffer(self._ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                               hostbuf=[scalar])
-        buf_out = cl.Buffer(self._ctx, cl.mem_flags.WRITE_ONLY, size * 4)
+        mf = cl.mem_flags
+        buf_left = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=left_flat)
+        buf_scalar = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                               hostbuf=np.array([scalar], dtype=np.float32))
+        buf_out = cl.Buffer(self._ctx, mf.WRITE_ONLY, left_flat.nbytes)
 
         self._kernels["scalar_right"](
             self._queue, (size,), None,
             buf_left, buf_scalar, buf_out,
-            op_code, size
+            np.int32(op_code), np.int32(size)
         )
+
+        result_np = np.empty(size, dtype=np.float32)
+        cl.enqueue_copy(self._queue, result_np, buf_out)
         self._queue.finish()
 
-        result = [0.0] * size
-        cl.enqueue_copy(self._queue, result, buf_out)
-        self._queue.finish()
-
-        left_shape = self._get_operand_shape(left)
-        return self._from_flat_list(result, left_shape)
+        return from_flat_buffer(result_np, shape)
 
     def _apply_scalar_op(self, left: float, right: float, op_code: int) -> float:
         """Apply scalar operation on CPU."""
@@ -546,19 +528,12 @@ class OpenCLArithmeticBackend(ComputeBackendBase):
 
     def _get_operand_shape(self, operand: Operand) -> tuple[int, ...]:
         """Get the shape of an operand."""
-        if is_number(operand):
-            return ()
-        if is_vector(operand):
-            return (len(operand),)
-        if is_matrix(operand):
-            return (len(operand), len(operand[0]))
-        return ()
+        return shape_of(operand)
 
     def dot(self, left: Operand, right: Operand) -> Operand:
         """Matrix multiplication / dot product."""
         self._ensure_opencl()
 
-        import numpy as np
         left_np = np.asarray(left)
         right_np = np.asarray(right)
 
@@ -589,23 +564,22 @@ class OpenCLArithmeticBackend(ComputeBackendBase):
             rows = len(matrix)
             cols = len(matrix[0])
 
-            flat = [float(x) for row in matrix for x in row]
-            buf_in = cl.Buffer(self._ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                              hostbuf=flat)
-            buf_out = cl.Buffer(self._ctx, cl.mem_flags.WRITE_ONLY, len(flat) * 4)
+            flat, _ = self._to_flat(matrix)
+            mf = cl.mem_flags
+            buf_in = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=flat)
+            buf_out = cl.Buffer(self._ctx, mf.WRITE_ONLY, flat.nbytes)
 
             self._kernels["transpose_op"](
-                self._queue, (len(flat),), None,
+                self._queue, (flat.size,), None,
                 buf_in, buf_out, np.int32(rows), np.int32(cols)
             )
+
+            result_np = np.empty(flat.size, dtype=np.float32)
+            cl.enqueue_copy(self._queue, result_np, buf_out)
             self._queue.finish()
 
-            result_flat = [0.0] * len(flat)
-            cl.enqueue_copy(self._queue, result_flat, buf_out)
-            self._queue.finish()
-
-            # Reshape: transpose swaps rows and cols
-            return [[result_flat[j * rows + i] for j in range(cols)] for i in range(rows)]
+            # Kernel writes the transposed matrix in row-major (cols, rows) layout.
+            return result_np.reshape(cols, rows).tolist()
 
         raise TypeError("Unsupported operand type")
 
@@ -621,24 +595,23 @@ class OpenCLArithmeticBackend(ComputeBackendBase):
 
     def _unary_op(self, operand: Operand, op_code: int) -> Operand:
         """Execute unary operation."""
-        flat, size = self._to_flat_list(operand)
+        flat, shape = self._to_flat(operand)
+        size = flat.size
 
-        buf_in = cl.Buffer(self._ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                          hostbuf=flat)
-        buf_out = cl.Buffer(self._ctx, cl.mem_flags.WRITE_ONLY, size * 4)
+        mf = cl.mem_flags
+        buf_in = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=flat)
+        buf_out = cl.Buffer(self._ctx, mf.WRITE_ONLY, flat.nbytes)
 
         self._kernels["unary_op"](
             self._queue, (size,), None,
-            buf_in, buf_out, op_code, size
+            buf_in, buf_out, np.int32(op_code), np.int32(size)
         )
+
+        result_np = np.empty(size, dtype=np.float32)
+        cl.enqueue_copy(self._queue, result_np, buf_out)
         self._queue.finish()
 
-        result = [0.0] * size
-        cl.enqueue_copy(self._queue, result, buf_out)
-        self._queue.finish()
-
-        shape = self._get_operand_shape(operand)
-        return self._from_flat_list(result, shape)
+        return from_flat_buffer(result_np, shape)
 
     def fill(self, shape: tuple[int, ...], value: Number) -> Operand:
         """Create array filled with value."""
@@ -654,18 +627,16 @@ class OpenCLArithmeticBackend(ComputeBackendBase):
             self._queue, (size,), None,
             buf_out, np.float32(value), np.int32(size)
         )
-        self._queue.finish()
 
-        result = [0.0] * size
-        cl.enqueue_copy(self._queue, result, buf_out)
+        result_np = np.empty(size, dtype=np.float32)
+        cl.enqueue_copy(self._queue, result_np, buf_out)
         self._queue.finish()
 
         if len(shape) == 1:
-            return result
+            return result_np.tolist()
         elif len(shape) == 2:
-            rows, cols = shape
-            return [[result[i * cols + j] for j in range(cols)] for i in range(rows)]
-        return result[0]
+            return result_np.reshape(shape).tolist()
+        return float(result_np[0])
 
     def zeros(self, shape: tuple[int, ...]) -> Operand:
         """Create zero array."""
