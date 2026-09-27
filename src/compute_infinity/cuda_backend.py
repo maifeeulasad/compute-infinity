@@ -15,9 +15,14 @@ from .core import (
     Number,
     Operand,
     ensure_operand,
+    from_flat_buffer,
     is_matrix,
     is_number,
     is_vector,
+    optimal_chunk_size,
+    optimal_launch_config,
+    shape_of,
+    to_flat_buffer,
 )
 
 # Lazy import for CUDA
@@ -25,6 +30,12 @@ try:
     from numba import cuda
 except Exception:  # pragma: no cover
     cuda = None
+
+# NumPy is required by Numba for host<->device transfers.
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
 
 # =============================================================================
 # Operation Codes
@@ -227,52 +238,40 @@ class CudaArithmeticBackend(ComputeBackendBase):
                 "NVIDIA drivers and CUDA toolkit."
             )
 
-    def _to_flat_list(self, operand: Operand) -> tuple[list[float], int]:
-        """Convert operand to flat list and return size."""
-        if is_number(operand):
-            return [float(operand)], 1
-        if is_vector(operand):
-            return [float(x) for x in operand], len(operand)
-        if is_matrix(operand):
-            flat = [float(x) for row in operand for x in row]
-            return flat, len(flat)
-        raise TypeError("Unsupported operand type")
+    def _to_flat(self, operand: Operand):
+        """Flatten an operand into a contiguous float32 device-ready array.
 
-    def _from_flat_list(self, flat: list[float], original_shape: tuple[int, ...]) -> Operand:
-        """Convert flat list back to original shape."""
-        if len(original_shape) == 0:
-            return flat[0] if len(flat) == 1 else flat
-        if len(original_shape) == 1:
-            return flat
-        if len(original_shape) == 2:
-            rows, cols = original_shape
-            return [flat[i * cols:(i + 1) * cols] for i in range(rows)]
-        return flat
+        Zero-copy when the caller already supplied a matching NumPy array.
+        """
+        return to_flat_buffer(operand, np, np.float32)
 
     def _get_operand_shape(self, operand: Operand) -> tuple[int, ...]:
         """Get the shape of an operand."""
-        if is_number(operand):
-            return ()
-        if is_vector(operand):
-            return (len(operand),)
-        if is_matrix(operand):
-            return (len(operand), len(operand[0]))
-        return ()
+        return shape_of(operand)
 
-    def _get_threads_per_block(self, size: int) -> int:
-        """Calculate optimal threads per block."""
-        return min(256, size)
-
-    def _get_blocks_per_grid(self, size: int, threads: int) -> int:
-        """Calculate blocks per grid."""
-        return (size + threads - 1) // threads
+    def _launch_config(self, size: int) -> tuple[int, int]:
+        """Auto-scale (blocks, threads) to the device and the problem size."""
+        max_threads = 256
+        warp_size = 32
+        try:
+            device = cuda.get_current_device()
+            max_threads = int(device.MAX_THREADS_PER_BLOCK)
+            warp_size = int(device.WARP_SIZE)
+        except Exception:
+            pass
+        return optimal_launch_config(size, max_threads, warp_size)
 
     def _check_chunk_size(self, size: int) -> int:
-        """Check if operation should be chunked to avoid OOM."""
-        max_size = self._memory_config.max_chunk_size
-        if size > max_size:
-            return max_size
-        return size
+        """Chunk size derived from free VRAM, capped by config, to avoid OOM."""
+        free_bytes: int | None = None
+        try:
+            free_bytes, _total = cuda.current_context().get_memory_info()
+        except Exception:
+            free_bytes = None
+        auto = optimal_chunk_size(free_bytes, num_buffers=3, bytes_per_element=4)
+        # Respect an explicit config ceiling when the user set a smaller one.
+        max_size = min(auto, self._memory_config.max_chunk_size)
+        return min(size, max_size)
 
     def plus(self, left: Operand, right: Operand) -> Operand:
         self._ensure_cuda()
@@ -305,9 +304,11 @@ class CudaArithmeticBackend(ComputeBackendBase):
         if is_number(right):
             return self._broadcast_scalar_right(left, float(right), op_code)
 
-        # Get flat representations
-        left_flat, left_size = self._to_flat_list(left)
-        right_flat, right_size = self._to_flat_list(right)
+        # Get flat array representations (zero-copy when already ndarrays)
+        left_flat, shape = self._to_flat(left)
+        right_flat, _ = self._to_flat(right)
+        left_size = left_flat.size
+        right_size = right_flat.size
 
         if left_size != right_size:
             raise ValueError(f"Shape mismatch: {left_size} vs {right_size}")
@@ -316,95 +317,82 @@ class CudaArithmeticBackend(ComputeBackendBase):
         max_chunk = self._check_chunk_size(left_size)
 
         if left_size <= max_chunk:
-            return self._binary_op_gpu(left_flat, right_flat, op_code, left_size, left)
+            return self._binary_op_gpu(left_flat, right_flat, op_code, left_size, shape)
         else:
             # Chunked execution for large arrays
-            return self._binary_op_chunked(left_flat, right_flat, op_code, left_size, left, max_chunk)
+            return self._binary_op_chunked(left_flat, right_flat, op_code, left_size, shape, max_chunk)
 
-    def _binary_op_gpu(self, left_flat: list[float], right_flat: list[float],
-                      op_code: int, size: int, original: Operand) -> Operand:
+    def _binary_op_gpu(self, left_flat, right_flat,
+                      op_code: int, size: int, shape: tuple[int, ...]) -> Operand:
         """Execute binary operation entirely on GPU."""
-        import numpy as np
-
-        d_left = cuda.to_device(np.array(left_flat, dtype=np.float32))
-        d_right = cuda.to_device(np.array(right_flat, dtype=np.float32))
+        d_left = cuda.to_device(left_flat)
+        d_right = cuda.to_device(right_flat)
         d_out = cuda.device_array(size, dtype=np.float32)
 
-        threads = self._get_threads_per_block(size)
-        blocks = self._get_blocks_per_grid(size, threads)
+        blocks, threads = self._launch_config(size)
 
         _cuda_binary_kernel[blocks, threads](d_left, d_right, d_out, op_code, size)
         cuda.synchronize()
 
         result = d_out.copy_to_host()
-        shape = self._get_operand_shape(original)
-        return self._from_flat_list(result.tolist(), shape)
+        return from_flat_buffer(result, shape)
 
-    def _binary_op_chunked(self, left_flat: list[float], right_flat: list[float],
-                          op_code: int, size: int, original: Operand,
+    def _binary_op_chunked(self, left_flat, right_flat,
+                          op_code: int, size: int, shape: tuple[int, ...],
                           chunk_size: int) -> Operand:
         """Execute binary operation in chunks to avoid OOM."""
-        import numpy as np
-
-        result_flat = [0.0] * size
+        result_flat = np.empty(size, dtype=np.float32)
 
         for i in range(0, size, chunk_size):
             end = min(i + chunk_size, size)
-            chunk_left = left_flat[i:end]
-            chunk_right = right_flat[i:end]
             chunk_size_actual = end - i
 
-            d_left = cuda.to_device(np.array(chunk_left, dtype=np.float32))
-            d_right = cuda.to_device(np.array(chunk_right, dtype=np.float32))
+            d_left = cuda.to_device(np.ascontiguousarray(left_flat[i:end]))
+            d_right = cuda.to_device(np.ascontiguousarray(right_flat[i:end]))
             d_out = cuda.device_array(chunk_size_actual, dtype=np.float32)
 
-            threads = self._get_threads_per_block(chunk_size_actual)
-            blocks = self._get_blocks_per_grid(chunk_size_actual, threads)
+            blocks, threads = self._launch_config(chunk_size_actual)
 
             _cuda_binary_kernel[blocks, threads](d_left, d_right, d_out, op_code, chunk_size_actual)
             cuda.synchronize()
 
-            chunk_result = d_out.copy_to_host()
-            result_flat[i:end] = chunk_result.tolist()
+            d_out.copy_to_host(result_flat[i:end])
 
-        shape = self._get_operand_shape(original)
-        return self._from_flat_list(result_flat, shape)
+        return from_flat_buffer(result_flat, shape)
 
     def _broadcast_scalar_left(self, scalar: float, right: Operand, op_code: int) -> Operand:
         """Broadcast scalar from left."""
-        right_flat, size = self._to_flat_list(right)
+        right_flat, shape = self._to_flat(right)
+        size = right_flat.size
 
         d_scalar = cuda.to_device(np.array([scalar], dtype=np.float32))
-        d_right = cuda.to_device(np.array(right_flat, dtype=np.float32))
+        d_right = cuda.to_device(right_flat)
         d_out = cuda.device_array(size, dtype=np.float32)
 
-        threads = self._get_threads_per_block(size)
-        blocks = self._get_blocks_per_grid(size, threads)
+        blocks, threads = self._launch_config(size)
 
         _cuda_scalar_left_kernel[blocks, threads](d_scalar, d_right, d_out, op_code, size)
         cuda.synchronize()
 
         result = d_out.copy_to_host()
-        shape = self._get_operand_shape(right)
-        return self._from_flat_list(result.tolist(), shape)
+        return from_flat_buffer(result, shape)
 
     def _broadcast_scalar_right(self, left: Operand, scalar: float, op_code: int) -> Operand:
         """Broadcast scalar from right."""
-        left_flat, size = self._to_flat_list(left)
+        left_flat, shape = self._to_flat(left)
+        size = left_flat.size
 
-        d_left = cuda.to_device(np.array(left_flat, dtype=np.float32))
+        d_left = cuda.to_device(left_flat)
         d_scalar = cuda.to_device(np.array([scalar], dtype=np.float32))
         d_out = cuda.device_array(size, dtype=np.float32)
 
-        threads = self._get_threads_per_block(size)
-        blocks = self._get_blocks_per_grid(size, threads)
+        blocks, threads = self._launch_config(size)
 
         _cuda_scalar_right_kernel[blocks, threads](d_left, d_scalar, d_out, op_code, size)
         cuda.synchronize()
 
         result = d_out.copy_to_host()
-        shape = self._get_operand_shape(left)
-        return self._from_flat_list(result.tolist(), shape)
+        return from_flat_buffer(result, shape)
 
     def _apply_scalar_op(self, left: float, right: float, op_code: int) -> float:
         """Apply scalar operation on CPU."""
@@ -420,7 +408,6 @@ class CudaArithmeticBackend(ComputeBackendBase):
         """Matrix multiplication / dot product."""
         self._ensure_cuda()
 
-        import numpy as np
         left_np = np.asarray(left)
         right_np = np.asarray(right)
 
@@ -438,25 +425,23 @@ class CudaArithmeticBackend(ComputeBackendBase):
             return list(matrix)
 
         if is_matrix(matrix):
-            import numpy as np
-
             rows = len(matrix)
             cols = len(matrix[0])
 
-            flat = [float(x) for row in matrix for x in row]
+            flat, _ = self._to_flat(matrix)
 
-            d_input = cuda.to_device(np.array(flat, dtype=np.float32))
+            d_input = cuda.to_device(flat)
             d_output = cuda.device_array(rows * cols, dtype=np.float32)
 
-            threads = self._get_threads_per_block(rows * cols)
-            blocks = self._get_blocks_per_grid(rows * cols, threads)
+            blocks, threads = self._launch_config(rows * cols)
 
             _cuda_transpose_kernel[blocks, threads](d_input, d_output, rows, cols)
             cuda.synchronize()
 
+            # Kernel writes output_mat[j * rows + i], i.e. the transposed
+            # matrix in row-major (cols, rows) layout.
             result = d_output.copy_to_host()
-            # Transpose swaps rows and cols
-            return [[result[j * rows + i] for j in range(cols)] for i in range(rows)]
+            return result.reshape(cols, rows).tolist()
 
         raise TypeError("Unsupported operand type")
 
@@ -472,28 +457,23 @@ class CudaArithmeticBackend(ComputeBackendBase):
 
     def _unary_op(self, operand: Operand, op_code: int) -> Operand:
         """Execute unary operation on GPU."""
-        flat, size = self._to_flat_list(operand)
+        flat, shape = self._to_flat(operand)
+        size = flat.size
 
-        import numpy as np
-
-        d_input = cuda.to_device(np.array(flat, dtype=np.float32))
+        d_input = cuda.to_device(flat)
         d_output = cuda.device_array(size, dtype=np.float32)
 
-        threads = self._get_threads_per_block(size)
-        blocks = self._get_blocks_per_grid(size, threads)
+        blocks, threads = self._launch_config(size)
 
         _cuda_unary_kernel[blocks, threads](d_input, d_output, op_code, size)
         cuda.synchronize()
 
         result = d_output.copy_to_host()
-        shape = self._get_operand_shape(operand)
-        return self._from_flat_list(result.tolist(), shape)
+        return from_flat_buffer(result, shape)
 
     def fill(self, shape: tuple[int, ...], value: Number) -> Operand:
         """Create array filled with value."""
         self._ensure_cuda()
-
-        import numpy as np
 
         size = 1
         for dim in shape:
@@ -501,8 +481,7 @@ class CudaArithmeticBackend(ComputeBackendBase):
 
         d_out = cuda.device_array(size, dtype=np.float32)
 
-        threads = self._get_threads_per_block(size)
-        blocks = self._get_blocks_per_grid(size, threads)
+        blocks, threads = self._launch_config(size)
 
         _cuda_fill_kernel[blocks, threads](d_out, float(value), size)
         cuda.synchronize()
@@ -512,8 +491,7 @@ class CudaArithmeticBackend(ComputeBackendBase):
         if len(shape) == 1:
             return result.tolist()
         elif len(shape) == 2:
-            rows, cols = shape
-            return [[result[i * cols + j] for j in range(cols)] for i in range(rows)]
+            return result.reshape(shape).tolist()
         return float(result[0])
 
     def zeros(self, shape: tuple[int, ...]) -> Operand:
