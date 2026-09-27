@@ -359,7 +359,7 @@ class OpenCLArithmeticBackend(ComputeBackendBase):
                 "dot_reduce": self._program.dot_reduce,
             }
         except Exception as e:
-            raise OpenCLBuildError(f"Failed to build OpenCL kernels: {e}")
+            raise OpenCLBuildError(f"Failed to build OpenCL kernels: {e}") from e
 
     @property
     def name(self) -> str:

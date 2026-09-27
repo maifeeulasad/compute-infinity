@@ -79,17 +79,17 @@ if roc is not None:
         if idx >= size:
             return
 
-        l = left[idx]
+        lv = left[idx]
         r = right[idx]
 
         if op_code == _OP_ADD:
-            output[idx] = l + r
+            output[idx] = lv + r
         elif op_code == _OP_SUB:
-            output[idx] = l - r
+            output[idx] = lv - r
         elif op_code == _OP_MUL:
-            output[idx] = l * r
+            output[idx] = lv * r
         elif op_code == _OP_DIV:
-            output[idx] = l / r
+            output[idx] = lv / r
         else:
             output[idx] = 0.0
 
@@ -121,17 +121,17 @@ if roc is not None:
         if idx >= size:
             return
 
-        l = left[idx]
+        lv = left[idx]
         s = scalar[0]
 
         if op_code == _OP_ADD:
-            output[idx] = l + s
+            output[idx] = lv + s
         elif op_code == _OP_SUB:
-            output[idx] = l - s
+            output[idx] = lv - s
         elif op_code == _OP_MUL:
-            output[idx] = l * s
+            output[idx] = lv * s
         elif op_code == _OP_DIV:
-            output[idx] = l / s
+            output[idx] = lv / s
         else:
             output[idx] = 0.0
 

@@ -205,7 +205,7 @@ class TestCPUBackend:
         """Test square root."""
         assert abs(cpu_backend.sqrt(4) - 2.0) < 1e-6
         result = cpu_backend.sqrt([4.0, 9.0, 16.0])
-        assert all(abs(r - e) < 1e-6 for r, e in zip(result, [2.0, 3.0, 4.0]))
+        assert all(abs(r - e) < 1e-6 for r, e in zip(result, [2.0, 3.0, 4.0], strict=True))
 
     def test_fill(self, cpu_backend):
         """Test fill operation."""

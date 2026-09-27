@@ -616,15 +616,15 @@ class CPUFallbackBackend(ComputeBackendBase):
             return eval(f"{left} {op} {right}")  # Safe: numbers only
         if is_vector(left) and is_vector(right):
             result = []
-            for l, r in zip(left, right):
-                result.append(eval(f"{l} {op} {r}"))
+            for lhs, rhs in zip(left, right, strict=True):
+                result.append(eval(f"{lhs} {op} {rhs}"))
             return result
         if is_matrix(left) and is_matrix(right):
             result = []
-            for l_row, r_row in zip(left, right):
+            for l_row, r_row in zip(left, right, strict=True):
                 row = []
-                for l, r in zip(l_row, r_row):
-                    row.append(eval(f"{l} {op} {r}"))
+                for lhs, rhs in zip(l_row, r_row, strict=True):
+                    row.append(eval(f"{lhs} {op} {rhs}"))
                 result.append(row)
             return result
         raise TypeError("Unsupported operand types")
