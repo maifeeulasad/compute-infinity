@@ -1,8 +1,29 @@
 # compute-infinity
 
+[![PyPI version](https://img.shields.io/pypi/v/compute-infinity.svg)](https://pypi.org/project/compute-infinity/)
+[![Python versions](https://img.shields.io/pypi/pyversions/compute-infinity.svg)](https://pypi.org/project/compute-infinity/)
+[![License](https://img.shields.io/pypi/l/compute-infinity.svg)](https://github.com/maifeeulasad/compute-infinity/blob/main/LICENSE)
+[![CI](https://github.com/maifeeulasad/compute-infinity/actions/workflows/ci.yml/badge.svg)](https://github.com/maifeeulasad/compute-infinity/actions/workflows/ci.yml)
+[![Downloads](https://img.shields.io/pypi/dm/compute-infinity.svg)](https://pypi.org/project/compute-infinity/)
+
 **High-Performance GPU Compute Library with Unified Backend Support**
 
 A Python library providing uniform compute operations across NVIDIA (CUDA), AMD (ROCm), and Intel (OpenCL) GPUs with memory-efficient chunking to prevent OOM errors.
+
+## Python Compatibility
+
+Tested on **CPython 3.10 – 3.15** (see the CI matrix in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)). `requires-python = ">=3.10"`.
+
+| Python | Status |
+|--------|--------|
+| 3.10 | ✅ Supported |
+| 3.11 | ✅ Supported |
+| 3.12 | ✅ Supported |
+| 3.13 | ✅ Supported |
+| 3.14 | ✅ Supported |
+| 3.15 | ✅ Supported (prerelease) |
+
+> The `pyversions` badge above reflects the classifiers published to PyPI and updates automatically with each release.
 
 ## Features
 
