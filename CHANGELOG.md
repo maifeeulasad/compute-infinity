@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-09-27
+
+### Fixed
+- Release packaging: publish to PyPI via an API token instead of trusted
+  publishing. (`0.2.0` was tagged but never reached PyPI, so `0.2.1` is the
+  first published build of this line and carries all `0.2.0` changes below.)
+
 ## [0.2.0] - 2026-09-27
 
 Performance and correctness release focused on the GPU compute path.
@@ -50,5 +57,6 @@ Performance and correctness release focused on the GPU compute path.
 - Initial multi-backend release (CUDA/ROCm/OpenCL scaffolding, CPU fallback,
   arithmetic operations, project metadata).
 
+[0.2.1]: https://github.com/maifeeulasad/compute-infinity/releases/tag/v0.2.1
 [0.2.0]: https://github.com/maifeeulasad/compute-infinity/releases/tag/v0.2.0
 [0.1.0]: https://github.com/maifeeulasad/compute-infinity/releases/tag/v0.1.0

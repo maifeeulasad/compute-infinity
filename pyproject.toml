@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "compute-infinity"
-version = "0.2.0"
+version = "0.2.1"
 description = "High-performance GPU compute library with unified backend support for NVIDIA, AMD, and Intel GPUs"
 readme = "README.md"
 requires-python = ">=3.10"
