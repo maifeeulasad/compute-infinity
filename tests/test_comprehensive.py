@@ -529,6 +529,80 @@ class TestConsistency:
             assert result["mat_plus"] == expected_mat_plus, f"Failed for {name}"
 
 
+class TestConversionHelpers:
+    """Tests for the shared host<->device conversion helpers."""
+
+    def test_roundtrip_scalar(self):
+        np = pytest.importorskip("numpy")
+        from compute_infinity import from_flat_buffer, to_flat_buffer
+        flat, shape = to_flat_buffer(5, np)
+        assert shape == ()
+        assert from_flat_buffer(flat, shape) == 5.0
+
+    def test_roundtrip_vector(self):
+        np = pytest.importorskip("numpy")
+        from compute_infinity import from_flat_buffer, to_flat_buffer
+        flat, shape = to_flat_buffer([1, 2, 3], np)
+        assert shape == (3,)
+        assert from_flat_buffer(flat, shape) == [1.0, 2.0, 3.0]
+
+    def test_roundtrip_matrix(self):
+        np = pytest.importorskip("numpy")
+        from compute_infinity import from_flat_buffer, to_flat_buffer
+        flat, shape = to_flat_buffer([[1, 2], [3, 4]], np)
+        assert shape == (2, 2)
+        assert flat.ndim == 1 and flat.size == 4
+        assert from_flat_buffer(flat, shape) == [[1.0, 2.0], [3.0, 4.0]]
+
+    def test_ndarray_input_is_zero_copy(self):
+        np = pytest.importorskip("numpy")
+        from compute_infinity import to_flat_buffer
+        arr = np.arange(6, dtype=np.float32)
+        flat, shape = to_flat_buffer(arr, np)
+        assert shape == (6,)
+        # No copy: the flattened view shares memory with the input array.
+        assert np.shares_memory(flat, arr)
+
+
+class TestAutoScaling:
+    """Tests for auto-scaling launch and chunk parameters."""
+
+    def test_launch_config_rounds_to_warp(self):
+        from compute_infinity import optimal_launch_config
+        blocks, threads = optimal_launch_config(10, max_threads_per_block=1024, warp_size=32)
+        assert threads == 32
+        assert blocks == 1
+
+    def test_launch_config_caps_at_device_limit(self):
+        from compute_infinity import optimal_launch_config
+        blocks, threads = optimal_launch_config(5000, max_threads_per_block=1024, warp_size=32)
+        assert threads == 1024
+        assert blocks == (5000 + 1023) // 1024
+
+    def test_launch_config_covers_all_elements(self):
+        from compute_infinity import optimal_launch_config
+        for size in (1, 31, 32, 33, 257, 100_000):
+            blocks, threads = optimal_launch_config(size, 256, 32)
+            assert blocks * threads >= size
+
+    def test_launch_config_empty(self):
+        from compute_infinity import optimal_launch_config
+        assert optimal_launch_config(0) == (1, 1)
+
+    def test_chunk_size_scales_with_free_memory(self):
+        from compute_infinity import optimal_chunk_size
+        small = optimal_chunk_size(1 * 1024**3)
+        large = optimal_chunk_size(16 * 1024**3)
+        assert large > small
+        # Should use far more than the old fixed 1M-element chunk.
+        assert large > 1_000_000
+
+    def test_chunk_size_falls_back_without_memory_info(self):
+        from compute_infinity import optimal_chunk_size
+        assert optimal_chunk_size(None) == 1 << 24
+        assert optimal_chunk_size(0) == 1 << 24
+
+
 # =============================================================================
 # Run Tests
 # =============================================================================
